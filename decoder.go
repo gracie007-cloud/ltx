@@ -7,14 +7,21 @@ import (
 	"hash"
 	"hash/crc64"
 	"io"
+	"math"
 
 	"github.com/pierrec/lz4/v4"
 )
 
+// lz4FrameFooterSize is the size of the LZ4 frame footer:
+// EndMark (4 bytes) + Content Checksum (4 bytes).
+// Used when decoding old format files without compressed size prefix.
+const lz4FrameFooterSize = 8
+
 // Decoder represents a decoder of an LTX file.
 type Decoder struct {
-	r  io.Reader   // main reader
-	zr *lz4.Reader // lz4 reader
+	r  io.Reader        // main reader
+	lr io.LimitedReader // limited reader for lz4 (reused)
+	zr *lz4.Reader      // lz4 reader
 
 	header    Header
 	trailer   Trailer
@@ -172,18 +179,44 @@ func (dec *Decoder) DecodePage(hdr *PageHeader, data []byte) error {
 		return err
 	}
 
-	// Read page data next.
-	dec.zr.Reset(dec.r)
-	if _, err := io.ReadFull(dec.zr, data); err != nil {
-		return err
+	// Read page data using format-specific approach.
+	if hdr.Flags&PageHeaderFlagSize != 0 {
+		// New block format: read size prefix, then LZ4 block data.
+		sizeBuf := make([]byte, 4)
+		if _, err := io.ReadFull(dec.r, sizeBuf); err != nil {
+			return fmt.Errorf("read data size: %w", err)
+		}
+		dec.writeToHash(sizeBuf)
+		dataSize := binary.BigEndian.Uint32(sizeBuf)
+
+		compressed := make([]byte, dataSize)
+		if _, err := io.ReadFull(dec.r, compressed); err != nil {
+			return fmt.Errorf("read compressed data: %w", err)
+		}
+		if _, err := lz4.UncompressBlock(compressed, data); err != nil {
+			return fmt.Errorf("decompress block: %w", err)
+		}
+	} else {
+		// Old format: use LimitedReader workaround for lz4 frame concatenation.
+		// The lz4 library peeks ahead after EOF to check for concatenated frames,
+		// so we limit reads to prevent it from reading into the next page header.
+		dec.lr.R = dec.r
+		dec.lr.N = math.MaxInt64
+		dec.zr.Reset(&dec.lr)
+
+		if _, err := io.ReadFull(dec.zr, data); err != nil {
+			return err
+		}
+
+		// Limit remaining reads to the LZ4 frame footer size before checking EOF.
+		dec.lr.N = lz4FrameFooterSize
+		if err := dec.readLZ4Trailer(); err != nil {
+			return fmt.Errorf("read lz4 trailer: %w", err)
+		}
 	}
+
 	dec.writeToHash(data)
 	dec.pageN++
-
-	// Read off the LZ4 trailer frame to ensure we hit EOF.
-	if err := dec.readLZ4Trailer(); err != nil {
-		return fmt.Errorf("read lz4 trailer: %w", err)
-	}
 
 	// Calculate checksum while decoding snapshots if tracking checksums.
 	if dec.header.IsSnapshot() && !dec.header.NoChecksum() {
@@ -301,8 +334,35 @@ func DecodePageData(b []byte) (hdr PageHeader, data []byte, err error) {
 		return hdr, data, nil
 	}
 
-	zr := lz4.NewReader(bytes.NewReader(b[PageHeaderSize:]))
-	data, err = io.ReadAll(zr)
+	if hdr.Flags&PageHeaderFlagSize != 0 {
+		// New block format: read size and decompress.
+		if len(b) < PageHeaderSize+4 {
+			return hdr, nil, fmt.Errorf("buffer too small for size prefix")
+		}
+		dataSize := binary.BigEndian.Uint32(b[PageHeaderSize:])
+		offset := PageHeaderSize + 4
+
+		if len(b) < offset+int(dataSize) {
+			return hdr, nil, fmt.Errorf("buffer too small for data: need %d, have %d", offset+int(dataSize), len(b))
+		}
+
+		// LZ4 block compressed data.
+		compressed := b[offset : offset+int(dataSize)]
+		// Estimate uncompressed size - pages are typically 512-65536 bytes.
+		// We'll use a reasonable upper bound and resize if needed.
+		data = make([]byte, 65536)
+		n, err := lz4.UncompressBlock(compressed, data)
+		if err != nil {
+			return hdr, nil, fmt.Errorf("decompress block: %w", err)
+		}
+		data = data[:n]
+	} else {
+		// Old frame format: use LZ4 reader.
+		r := bytes.NewReader(b[PageHeaderSize:])
+		zr := lz4.NewReader(r)
+		data, err = io.ReadAll(zr)
+	}
+
 	return hdr, data, err
 }
 
